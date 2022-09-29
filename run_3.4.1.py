@@ -26,10 +26,10 @@ pi = np.pi
 def get_args():
     parser = argparse.ArgumentParser('PINNs for Burgers1', add_help=False)
     parser.add_argument('-f', type=str, default="external")
-    parser.add_argument('--net_type', default='pinn_rar', type=str)
-    parser.add_argument('--epochs_adam', default=20000, type=int)
-    parser.add_argument('--save_freq', default=1000, type=int, help="frequency to save model and image")
-    parser.add_argument('--print_freq', default=200, type=int, help="frequency to print loss")
+    parser.add_argument('--net_type', default='gpinn', type=str)
+    parser.add_argument('--epochs_adam', default=50000, type=int)
+    parser.add_argument('--save_freq', default=5000, type=int, help="frequency to save model and image")
+    parser.add_argument('--print_freq', default=1000, type=int, help="frequency to print loss")
     parser.add_argument('--device', default=True, type=bool, help="use gpu")
     parser.add_argument('--work_name', default='Burgers', type=str, help="save_path")
 
@@ -67,10 +67,9 @@ class Net_single(DeepModel_single):
 
             d2udtx, d2udt2 = Ddudt[:, 0:1], Ddudt[:, 1:2]
             d3udx3, d3udx2t = Dd2udx2[:, 0:1], Dd2udx2[:, 1:2]
-
             g_eqs = [d2udtx + (dudx * dudx + out_var * d2udx2) - 0.01 / pi * d3udx3,
-                     d2udt2 + dudt * dudx + out_var * d2udtx - 0.01 / pi * d3udx2t, ]
-            # g_eqs = paddle.concat(g_eqs, axis=-1)
+                     d2udt2 + (dudt * dudx + out_var * d2udtx) - 0.01 / pi * d3udx2t, ]
+            # g_eqs = paddle.incubate.autograd.grad(eqs, inn_var)
         else:
             g_eqs = paddle.zeros((2,), dtype=paddle.float32)
 
@@ -93,16 +92,17 @@ def build(opts, model):
     # val_grad = paddle.incubate.autograd.grad(val, Val_var)
 
     EQsLoss = paddle.norm(eqs, p=2) ** 2 / opts.Nx_EQs  # 方程所有计算守恒残差点的损失，不参与训练
-    gEQsLoss = paddle.norm(g_eqs[0], p=2) ** 2 / opts.Nx_EQs + paddle.norm(g_eqs[1], p=2) ** 2 / opts.Nx_EQs
+    gEQsLoss = (paddle.norm(g_eqs[0], p=2) ** 2 / opts.Nx_EQs + paddle.norm(g_eqs[1], p=2) ** 2 / opts.Nx_EQs) / 2
     datLoss = paddle.norm(Val_tar - val, p=2) ** 2 / opts.Nt_Val / opts.Nx_Val  # 方程所有计算守恒残差点的损失，不参与训练
 
     total_loss = EQsLoss + gEQsLoss * opts.g_weight
-    optimizer = paddle.optimizer.Adam(0.001)
+    scheduler = paddle.optimizer.lr.MultiStepDecay(0.001, [opts.epochs_adam*0.6, opts.epochs_adam*0.8], gamma=0.1)
+    optimizer = paddle.optimizer.Adam(scheduler)
     # optimizer = paddle.incubate.optimizer.functional.minimize_lbfgs(func, x0)
     optimizer.minimize(total_loss)
     # optimizer.minimize(EQsLoss)
     #
-    return [val, eqs_v], [EQsLoss, gEQsLoss, datLoss, total_loss]
+    return [val, eqs_v], [EQsLoss, gEQsLoss, datLoss, total_loss], scheduler
 
 
 def gen_testdata():
@@ -130,15 +130,12 @@ def gen_traindata(N, method='uniform'):
         n = int(N * 0.05)
         xx = np.random.random(N) * 2 - 1
         tt = np.random.random(N)
-        xx = np.concatenate([xx, np.ones((n, 1))*-1, np.ones((n, 1))*1, np.random.random(n)*2-1])
-        tt = np.concatenate([tt , np.random.random(n), np.random.random(n), np.zeros((n, 1))*1])
 
     X = np.vstack((np.ravel(xx), np.ravel(tt))).T
     return X.astype(np.float32)
 if __name__ == '__main__':
 
     opts = get_args()
-    print(opts)
 
     try:
         import paddle.fluid as fluid
@@ -161,8 +158,8 @@ if __name__ == '__main__':
 
     # 将控制台的结果输出到a.log文件，可以改成a.txt
     sys.stdout = visual_data.Logger(os.path.join(work_path, 'train.log'), sys.stdout)
-
-    train_x = gen_traindata(opts.Nx_EQs, method='sobol')  # 生成监督测点
+    print(opts)
+    train_x = gen_traindata(opts.Nx_EQs, method='random')  # 生成监督测点
     valid_x, valid_u = gen_testdata()
     valid_x, valid_u = valid_x.reshape((-1, 2)), valid_u.reshape((-1, 1))
 
@@ -171,7 +168,7 @@ if __name__ == '__main__':
 
     planes = [2, ] + [32, ] * 3 + [1, ]
     Net_model = Net_single(planes=planes, active=nn.Tanh())
-    [U_pred, R_pred], Loss = build(opts, Net_model)
+    [U_pred, R_pred], Loss, Scheduler = build(opts, Net_model)
 
     exe = static.Executor(place)
     exe.run(static.default_startup_program())
@@ -184,7 +181,7 @@ if __name__ == '__main__':
 
     for epoch in range(start_epoch, 1+opts.epochs_adam):
         ## 采样
-
+        Scheduler.step()
         exe.run(prog, feed={'EQs_var': train_x, 'Val_var': valid_x, 'Val_tar': valid_u}, fetch_list=[Loss[-1]])
 
         if epoch > 0 and epoch % opts.print_freq == 0:
@@ -201,7 +198,7 @@ if __name__ == '__main__':
             # print(loss_items[1:])
 
             print('iter: {:6d}, lr: {:.1e}, cost: {:.2f}, val_loss: {:.2e}, EQs_loss: {:.2e}, Grad_loss: {:.2e}'.
-                  format(epoch, 0.001, time.time() - star_time, float(loss_items[-1]),
+                  format(epoch, Scheduler.get_lr(), time.time() - star_time, float(loss_items[-1]),
                          float(loss_items[0]), float(loss_items[1])))
             star_time = time.time()
 

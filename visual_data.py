@@ -39,11 +39,11 @@ class matplotlib_vision(object):
         self.fig, self.axes = plt.subplots(len(self.field_name), 3, gridspec_kw=gs_dict, num=100, figsize=(30, 20))
         self.font = {'weight': 'normal', 'size': 30}
 
-    def plot_loss(self, x, y, label, title=None, color=None):
+    def plot_loss(self, x, y, label, title=None, color=None, marker=None):
         # sbn.set_style('ticks')
         # sbn.set(color_codes=True)
 
-        plt.plot(x, y, label=label, color=color)
+        plt.plot(x, y, label=label, color=color, marker=marker)
         plt.semilogy()
         plt.grid(True)  # 添加网格
         plt.legend(loc="upper right", prop=self.font)

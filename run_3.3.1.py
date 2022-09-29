@@ -26,9 +26,9 @@ def get_args():
     parser = argparse.ArgumentParser('PINNs for Brinkman-Forchheimer model', add_help=False)
     parser.add_argument('-f', type=str, default="external")
     parser.add_argument('--net_type', default='gpinn', type=str)
-    parser.add_argument('--epochs_adam', default=60000, type=int)
-    parser.add_argument('--save_freq', default=2000, type=int, help="frequency to save model and image")
-    parser.add_argument('--print_freq', default=200, type=int, help="frequency to print loss")
+    parser.add_argument('--epochs_adam', default=50000, type=int)
+    parser.add_argument('--save_freq', default=10000, type=int, help="frequency to save model and image")
+    parser.add_argument('--print_freq', default=2000, type=int, help="frequency to print loss")
     parser.add_argument('--device', default=True, type=bool, help="use gpu")
     parser.add_argument('--work_name', default='Brinkman-Forchheimer-1', type=str, help="save_path")
 
@@ -59,10 +59,11 @@ class Net_single(DeepModel_single):
         dudx = paddle.incubate.autograd.grad(out_var, inn_var)
         d2udx2 = paddle.incubate.autograd.grad(dudx, inn_var)
         # v_e = paddle.log(paddle.exp(self.v_e) + 1) * 0.1 #self.get_parameter #float(np.log(np.exp(1e-3)) + 1) * 0.1
-        eqs = - 1 / e * d2udx2 * self.get_parameter + v * out_var / K - g
-        if opts.net_type == 'gpinn':
-            d3udx3 = paddle.incubate.autograd.grad(d2udx2, inn_var)
-            g_eqs = -1 / e * d3udx3 * self.get_parameter + v / K * dudx
+        eqs = - 1 / e * d2udx2 * self.get_parameter + v / K * out_var - g
+        if 'gpinn' in opts.net_type:
+            # d3udx3 = paddle.incubate.autograd.grad(d2udx2, inn_var)
+            # g_eqs = -1 / e * d3udx3 * self.get_parameter + v / K * dudx
+            g_eqs = paddle.incubate.autograd.grad(eqs, inn_var)
         else:
             g_eqs = paddle.zeros((1,), dtype=paddle.float32)
 
@@ -72,19 +73,12 @@ class Net_single(DeepModel_single):
 def build(opts, model):
     ## 采样
 
-    # print(out_BCs)
-
     EQs_var = paddle.static.data('EQs_var', shape=[opts.Nx_EQs, 1], dtype='float32')
     EQs_var.stop_gradient = False
     # EQs_tar = paddle.static.data('EQs_tar', shape=[opts.Nx_EQs, 1], dtype='float32')
 
-    # print(EQs_var)
-    BCs_var = paddle.static.data('BCs_var', shape=[2, 1], dtype='float32')
-    BCs_var.stop_gradient = True
-    BCs_tar = paddle.static.data('BCs_tar', shape=[2, 1], dtype='float32')
-
     Sup_var = paddle.static.data('Sup_var', shape=[opts.Nx_Sup, 1], dtype='float32')
-    Sup_var.stop_gradient = True
+    Sup_var.stop_gradient = False
     Sup_tar = paddle.static.data('Sup_tar', shape=[opts.Nx_Sup, 1], dtype='float32')
 
     Val_var = paddle.static.data('Val_var', shape=[opts.Nx_Val, 1], dtype='float32')
@@ -94,29 +88,24 @@ def build(opts, model):
     eqs, g_eqs = model.equation(EQs_var)
     sup = model(Sup_var)
     sup = model.out_transform(Sup_var, sup)
-    bcs = model(BCs_var)
-    bcs = model.out_transform(BCs_var, bcs)
     val = model(Val_var)
     val = model.out_transform(Val_var, val)
     val_grad = paddle.incubate.autograd.grad(val, Val_var)
 
     # print(fields_all)
-
     EQsLoss = paddle.norm(eqs, p=2) ** 2 / opts.Nx_EQs  # 方程所有计算守恒残差点的损失，不参与训练
     gEQsLoss = paddle.norm(g_eqs, p=2) ** 2 / opts.Nx_EQs  # 方程所有计算守恒残差点的损失，不参与训练
     SupLoss = paddle.norm(Sup_tar - sup, p=2) ** 2 / opts.Nx_Sup  # 方程所有计算守恒残差点的损失，不参与训练
-    BCsLoss = paddle.norm(BCs_tar - bcs, p=2) ** 2 / 2
     datLoss = paddle.norm(Val_tar - val, p=2) ** 2 / opts.Nx_Val  # 方程所有计算守恒残差点的损失，不参与训练
 
-    total_loss = EQsLoss + SupLoss + gEQsLoss * opts.g_weight
+    total_loss = EQsLoss + SupLoss * 5 + gEQsLoss * opts.g_weight
 
-    # print(model.parameters())
-    # print(total_loss)
-    optimizer = paddle.optimizer.Adam(0.001)
+    scheduler = paddle.optimizer.lr.MultiStepDecay(0.001, [opts.epochs_adam*0.8, opts.epochs_adam*0.9], gamma=0.1)
+    optimizer = paddle.optimizer.Adam(scheduler, beta1=0.8, beta2=0.9)
     optimizer.minimize(total_loss)
     # optimizer.minimize(EQsLoss)
     #
-    return [val, val_grad], [EQsLoss, BCsLoss, SupLoss, gEQsLoss, datLoss, total_loss]
+    return [val, val_grad], [EQsLoss, SupLoss, gEQsLoss, datLoss, total_loss], scheduler
 
 
 # 解析解 ve=1e-3
@@ -146,7 +135,6 @@ def gen_all(num):
 if __name__ == '__main__':
 
     opts = get_args()
-    print(opts)
     g = 1
     v = 1e-3
     K = 1e-3
@@ -172,19 +160,16 @@ if __name__ == '__main__':
 
     # 将控制台的结果输出到a.log文件，可以改成a.txt
     sys.stdout = visual_data.Logger(os.path.join(work_path, 'train.log'), sys.stdout)
-
+    print(opts)
     sup_x, sup_u = gen_sup(opts.Nx_Sup)  # 生成监督测点
     train_x, train_u, _ = gen_all(opts.Nx_EQs)
     valid_x, valid_u, valid_g = gen_all(opts.Nx_Val)
-    bcs_x, bcs_u = train_x[[0, -1]], train_u[[0, -1]]
-
-    # print(bcs_x)
 
     paddle.incubate.autograd.enable_prim()
 
     planes = [1, ] + [20, ] * 3 + [1, ]
     Net_model = Net_single(planes=planes, active=nn.Tanh())
-    [U_pred, U_grad], Loss = build(opts, Net_model)
+    [U_pred, U_grad], Loss, Scheduler = build(opts, Net_model)
 
     exe = static.Executor(place)
     exe.run(static.default_startup_program())
@@ -198,13 +183,13 @@ if __name__ == '__main__':
 
     for epoch in range(start_epoch, 1+opts.epochs_adam):
         ## 采样
-
-        exe.run(prog, feed={'EQs_var': train_x, 'BCs_var': bcs_x, 'BCs_tar': bcs_u, 'Sup_var': sup_x, 'Sup_tar': sup_u,
+        Scheduler.step()
+        exe.run(prog, feed={'EQs_var': train_x, 'Sup_var': sup_x, 'Sup_tar': sup_u,
                             'Val_var': valid_x, 'Val_tar': valid_u}, fetch_list=[Loss[-1]])
 
         if epoch > 0 and epoch % opts.print_freq == 0:
-            all_items = exe.run(prog, feed={'EQs_var': train_x, 'BCs_var': bcs_x, 'BCs_tar': bcs_u, 'Sup_var': sup_x,
-                                            'Sup_tar': sup_u, 'Val_var': valid_x, 'Val_tar': valid_u},
+            all_items = exe.run(prog, feed={'EQs_var': train_x, 'Sup_var': sup_x, 'Sup_tar': sup_u,
+                                            'Val_var': valid_x, 'Val_tar': valid_u},
                                 fetch_list=[[U_pred, U_grad, Net_model.get_parameter] + Loss[:-1]])
 
             u_pred = all_items[0]
@@ -216,9 +201,9 @@ if __name__ == '__main__':
             par_pred.append(np.array(p_pred))
 
             print('iter: {:6d}, lr: {:.1e}, cost: {:.2f}, val_loss: {:.2e}, v_e_pred: {:.2e}\n'
-                  'EQs_loss: {:.2e}, BCS_loss: {:.2e}, Sup_loss: {:.2e}, Grad_loss: {:.2e}'.
-                  format(epoch, 0.001, time.time() - star_time, float(loss_items[-1]), float(p_pred),
-                         float(loss_items[0]), float(loss_items[1]), float(loss_items[2]), float(loss_items[3])))
+                  'EQs_loss: {:.2e}, Sup_loss: {:.2e}, Grad_loss: {:.2e}'.
+                  format(epoch, Scheduler.get_lr(), time.time() - star_time, float(loss_items[-2]), float(p_pred),
+                         float(loss_items[0]), float(loss_items[1]), float(loss_items[2])))
             star_time = time.time()
             # print(np.array(par_pred).shape)
         if epoch > 0 and epoch % opts.save_freq == 0:
@@ -226,10 +211,9 @@ if __name__ == '__main__':
             plt.clf()
             Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, -1], 'dat_loss')
             Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 0], 'eqs_loss')
-            # Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 1], 'BCS_loss')
-            Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 2], 'sup_loss')
-            if opts.net_type == "gpinn":
-                Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 3], 'grad_loss')
+            Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 1], 'sup_loss')
+            if "gpinn" in opts.net_type:
+                Visual.plot_loss(np.arange(len(log_loss)), np.array(log_loss)[:, 2], 'grad_loss')
             plt.savefig(os.path.join(tran_path, 'log_loss.svg'))
 
             plt.figure(1, figsize=(20, 10))
