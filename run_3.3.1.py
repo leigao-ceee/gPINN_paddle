@@ -26,7 +26,7 @@ def get_args():
     parser = argparse.ArgumentParser('PINNs for Brinkman-Forchheimer model', add_help=False)
     parser.add_argument('-f', type=str, default="external")
     parser.add_argument('--net_type', default='gpinn', type=str)
-    parser.add_argument('--epochs_adam', default=50000, type=int)
+    parser.add_argument('--epochs_adam', default=40000, type=int)
     parser.add_argument('--save_freq', default=10000, type=int, help="frequency to save model and image")
     parser.add_argument('--print_freq', default=2000, type=int, help="frequency to print loss")
     parser.add_argument('--device', default=True, type=bool, help="use gpu")
@@ -34,7 +34,7 @@ def get_args():
 
     parser.add_argument('--Nx_EQs', default=30, type=int)
     parser.add_argument('--Nx_Sup', default=5, type=int)
-    parser.add_argument('--Nx_Val', default=500, type=int)
+    parser.add_argument('--Nx_Val', default=200, type=int)
     parser.add_argument('--g_weight', default=0.1, type=float)
     return parser.parse_args()
 
@@ -100,8 +100,8 @@ def build(opts, model):
 
     total_loss = EQsLoss + SupLoss * 5 + gEQsLoss * opts.g_weight
 
-    scheduler = paddle.optimizer.lr.MultiStepDecay(0.001, [opts.epochs_adam*0.8, opts.epochs_adam*0.9], gamma=0.1)
-    optimizer = paddle.optimizer.Adam(scheduler, beta1=0.8, beta2=0.9)
+    scheduler = paddle.optimizer.lr.MultiStepDecay(0.001, [opts.epochs_adam*8, opts.epochs_adam*9], gamma=0.1)
+    optimizer = paddle.optimizer.Adam(scheduler)
     optimizer.minimize(total_loss)
     # optimizer.minimize(EQsLoss)
     #
@@ -120,7 +120,7 @@ def grad(x):
 
 
 def gen_sup(num):
-    xvals = np.linspace(1 / (num + 1), 1, num, dtype=np.float32, endpoint=False)
+    xvals = np.linspace(0, 1, num+2, dtype=np.float32)[1:-1]
     yvals = sol(xvals)
     return np.reshape(xvals, (-1, 1)), np.reshape(yvals, (-1, 1))
 
@@ -162,7 +162,7 @@ if __name__ == '__main__':
     sys.stdout = visual_data.Logger(os.path.join(work_path, 'train.log'), sys.stdout)
     print(opts)
     sup_x, sup_u = gen_sup(opts.Nx_Sup)  # 生成监督测点
-    train_x, train_u, _ = gen_all(opts.Nx_EQs)
+    train_x, train_u = gen_sup(opts.Nx_EQs)
     valid_x, valid_u, valid_g = gen_all(opts.Nx_Val)
 
     paddle.incubate.autograd.enable_prim()
@@ -200,7 +200,7 @@ if __name__ == '__main__':
             log_loss.append(np.array(loss_items).squeeze())
             par_pred.append(np.array(p_pred))
 
-            print('iter: {:6d}, lr: {:.1e}, cost: {:.2f}, val_loss: {:.2e}, v_e_pred: {:.2e}\n'
+            print('iter: {:6d}, lr: {:.1e}, cost: {:.2f}, val_loss: {:.2e}, v_e_pred: {:.2e}, '
                   'EQs_loss: {:.2e}, Sup_loss: {:.2e}, Grad_loss: {:.2e}'.
                   format(epoch, Scheduler.get_lr(), time.time() - star_time, float(loss_items[-2]), float(p_pred),
                          float(loss_items[0]), float(loss_items[1]), float(loss_items[2])))
